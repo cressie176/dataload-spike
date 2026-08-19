@@ -1,0 +1,7 @@
+node_modules/
+.env
+*.log
+
+# Generated build input — regenerable from scripts/generate-seed.ts (deterministic).
+# Not committed: it's large and reproducible; its content hash tags the image.
+seed.sql

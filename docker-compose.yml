@@ -1,0 +1,24 @@
+# Throwaway harness DB. `docker compose up` builds locally (or pulls the pinned
+# tag if HARNESS_IMAGE points at a published one). The container is disposable:
+# every query runs in BEGIN..ROLLBACK, so the baked data stays pristine.
+services:
+  db:
+    image: ${HARNESS_IMAGE:-parkdata:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "5433:5432"
+    environment:
+      # The baked cluster already has these baked in; set here only so the
+      # healthcheck's psql knows which db/user to hit.
+      PGUSER: harness
+      PGDATABASE: parkdb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U harness -d parkdb"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    # Data is disposable; no volume. Container teardown discards everything.
+    tmpfs:
+      - /tmp
