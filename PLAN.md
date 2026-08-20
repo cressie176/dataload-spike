@@ -6,7 +6,7 @@
 
 The example workload is a holiday-park booking system. Under a traffic spike (e.g. after a marketing email) it can see thousands of concurrent users at once; at that concurrency a single bad query plan on a hot table is catastrophic, while query *planning* overhead is negligible. This harness runs `EXPLAIN ANALYZE` over every SQL query in the codebase and flags any whose plan is expensive enough to be worth a human look, using a large, production-shaped dataset so the plans are representative.
 
-Second purpose: **evaluate Drizzle ORM** as a candidate persistence framework — how it feels for **schema definition + migration generation**, and how comfortably it coexists with queries-under-test living as **externalised `.sql` files** (which Drizzle gives no type-safety over).
+Second purpose: **evaluate Drizzle ORM** as a candidate persistence framework — how it feels for **schema definition + migration generation**, and how well its query builder expresses the queries-under-test as a **typed persistence facade** that the harness gates automatically.
 
 **Scope: local only, no CI/CD.** Standalone project. Design is CI-aware (versioned image, harness reads image ref from config) so CI can be added later without rework.
 
@@ -34,19 +34,19 @@ park (id, name)
 3. **The dataset is baked into a Docker image**, post-`VACUUM (FREEZE, ANALYZE)`; the image is the frozen "template". A throwaway container is created per harness run and destroyed after.
    - Bake at **build time** into a **non-volume `PGDATA`** (e.g. `/var/lib/postgresql/baked`), because the official image declares the default data dir a `VOLUME` and build-time writes to a VOLUME are discarded. Container start is then instant (no init).
    - `VACUUM (FREEZE, ANALYZE)` in the build: **FREEZE** stops later transaction-ID-wraparound rewrites that would dirty files at runtime; **ANALYZE** captures the planner stats the harness depends on.
-   - **No `CREATE DATABASE ... TEMPLATE` clone.** A container-from-image is already a copy-on-write clone (cheaper than Postgres's physical template copy), and since every query runs in `BEGIN … ROLLBACK` the data is never mutated. The template-clone step was for the original "tests may mutate" framing and is superseded by rollback-per-query. (Revisit only if parallelising or running something un-rollback-able.)
+   - **No `CREATE DATABASE ... TEMPLATE` clone.** A container-from-image is already a copy-on-write clone (cheaper than Postgres's physical template copy), and since the harness only gates read paths the data is never mutated. The template-clone step was for the original "tests may mutate" framing and is superseded by read-only gating. (Revisit only if parallelising or gating something that mutates.)
    - **Image versioned by content hash** of (migration files + generated seed). Harness reads the image ref from env/config, defaulting to the pinned published tag; devs override to a locally-built tag when they've changed schema/seed. Unifies "published vs local" with no code change.
 4. **Postgres major version: pinned to 18** (`postgres:18`) — explicit tag, never `latest`, because plan quality depends on the major. Mirror prod planner GUCs (`random_page_cost`, `work_mem`, `effective_cache_size`, `default_statistics_target`) in the image config. Note: PG18's planner may pick different plans than the PG15/16 in prod RDS — fine for the POC (evaluating the mechanism), but when picking the real target service the harness's major version should match that service's prod.
 
 ## Harness behaviour (see README for full rationale)
 
-- Queries live in a folder, one `.sql` per query, each with an inline `/* @test ... */` block (YAML/JSON): either `params` (list of `{ values, thresholds }`, referenced by index) or `skip: "<reason>"` (reason required).
-- Per query, per param set: `BEGIN; EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS) <query>; ROLLBACK;`.
-- **Gates** (per param set, global default overridable):
+- Queries are exported functions in a **persistence facade** (`src/persistence.ts`), built with Drizzle. The harness wraps Drizzle in a **`pg-proxy` driver** that runs `EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS)` on each generated read query, captures the plan, then delegates the real query to node-pg. Only reads are gated; writes/DDL pass through un-analysed.
+- The test holds a `GATES` map keyed by facade function name → list of **cases**; each case either `{ run, gate }` (invoke with representative args + limits) or `{ skip: "<reason>" }`. Gates live in the test, keeping the facade free of test concerns.
+- **Gates** (per case, global default overridable):
   - `cost` — top-node Total Cost. Default **100**. A "worth checking" tripwire, not a pass target.
   - `rowCountRatio` — `max(actual,plan)/min(actual,plan)`. Default **10**. Tripwire for bad stats; a ratio so proportional data growth doesn't churn it.
 - `Actual Total Time` is **captured/reported but not asserted** (hardware-sensitive).
-- **Coverage**: strict. No `@test` block → untested → fail. Block with neither `params` nor `skip`, or malformed → fail loudly. Valid `skip` → recorded and printed in a skip summary.
+- **Coverage**: the facade is the coverage surface. A test asserts every exported facade function has a `GATES` entry — an ungated function fails as untested. No query can exist outside the facade, so none can escape gating.
 - Custom plans only (assumes the app uses node-pg on its unnamed query path → value-optimal custom plans; no generic-plan handling).
 
 ## Build steps
@@ -56,8 +56,8 @@ park (id, name)
 3. **Generate initial migration** — `drizzle-kit generate` → `migrations/0000_*.sql` + snapshots. Commit them.
 4. **Seed generator** — `scripts/generate-seed.ts`: parameterised (park count, seasons, seasonal weight curve, stay-length model), seeded RNG for reproducibility → stable image hash. Emits `seed.sql` using `COPY`.
 5. **Dockerfile** — base `postgres:18`; build stage: initdb → apply migrations → apply seed → `VACUUM (FREEZE, ANALYZE)` into a non-volume `PGDATA`; mirror prod GUCs. Plus `docker-compose.yml` for local build-or-pull + throwaway container.
-6. **Query folder** — `queries/*.sql`: ~5–6 representative queries (date-range availability, park bookings, vans-by-grade, 4-table join, one deliberately-expensive) each with an `@test` block, plus one `skip` example (a `VACUUM` maintenance script), plus one with no `@test` block to prove the coverage failure path.
-7. **Harness runner** — built on **`node:test`** (zero-dependency). Discover `queries/*.sql` first, then generate a subtest per query/param set: parse the `@test` block (strict), run the wrapped `EXPLAIN ANALYZE` against the container DB, parse JSON, assert gates. `skip: "<reason>"` → `t.skip(reason)`. **Coverage checked outside the per-test loop** — a `.sql` with no `@test` block isn't a failed test, it's one that never existed, so discovery asserts every file yielded a test (or valid skip) and fails otherwise. `Actual Total Time` + cost/rowCountRatio surfaced via `diagnostic()` / test names so they show on passing tests too.
+6. **Persistence facade** — `src/persistence.ts`: ~5–6 representative queries as Drizzle functions (date-range availability, park bookings, vans-by-grade, 4-table join, one deliberately-expensive), plus a `vacuumReservation` that the harness skips. Driver-agnostic (`Db = PgDatabase<any>`) so the app can wire it to node-postgres and the harness to the gated pg-proxy driver.
+7. **Harness runner** — built on **`node:test`** (zero-dependency). Wrap Drizzle in the pg-proxy gate driver (`test/harness/gate.ts`), then iterate the `GATES` map: a subtest per facade function, a sub-subtest per case. `planOf(call)` invokes the facade function through the gate and returns the single captured plan; assert gates. `skip` → `t.skip(reason)`. **Coverage checked separately** — one test asserts every exported facade function appears in `GATES`, so an ungated function fails as untested. Cost/rowCountRatio surfaced via `diagnostic()` when a gate is breached.
 
 ## Future scaling (reasoning captured; NOT built now)
 
@@ -71,15 +71,15 @@ Not needed at POC scale (~300–500MB image).
 ## Notes / caveats
 
 - Postgres core has **no query planner hints** (Oracle-style `/*+ ... */`); `pg_hint_plan` is out-of-tree. Reinforces the harness's value — you can't hint away a bad plan in prod, so catching it early via cost is the real lever. (Distinct from **hint bits**, an internal MVCC commit-status flag set lazily on first read — one of the things that dirties "static" files at runtime, hence the FREEZE.)
-- Externalised `.sql` queries get **no Drizzle type-safety**; schema drift surfaces only at runtime when a query fails to parse/execute. Watching how this feels is an explicit evaluation goal.
+- Facade queries built with Drizzle's query builder are **type-checked against the schema** — a column rename surfaces at compile time, not runtime. The trade is that gating happens through a `pg-proxy` driver whose read/write classification is string-based (`isRead`); watching how that heuristic holds up is an explicit evaluation goal.
 
 ## Verification
 
 - `docker compose up` (build or pull) → container healthy, DB populated, stats present (`SELECT * FROM pg_stats WHERE tablename='reservation'` non-empty).
-- Run the harness: discovers all `queries/*.sql`, runs `EXPLAIN ANALYZE`, prints costs, fails a deliberately-expensive query, passes cheap ones, honours a per-query override, records the `skip` example, flags a query with no `@test` block as untested.
+- Run the harness: gates every facade function through the pg-proxy driver, runs `EXPLAIN ANALYZE`, prints costs, fails the deliberately-expensive query, passes cheap ones, honours per-case overrides, skips `vacuumReservation`, and fails coverage if a facade function has no `GATES` entry.
 - Spot-check a July date-range query vs a November one produce **different** plans/costs (proves the seasonal distribution works).
 - Row counts identical before/after a full run (rollback works).
-- Capture Drizzle evaluation notes: how `generate` felt, readability of the generated migration SQL, the externalised-SQL disconnect.
+- Capture Drizzle evaluation notes: how `generate` felt, readability of the generated migration SQL, and how naturally the query builder + pg-proxy gate express the facade.
 
 ## Open question (non-blocking)
 

@@ -1,6 +1,6 @@
 # Query Cost Test Harness — Spike
 
-A spike for validating that every SQL query in the codebase produces an acceptable query plan cost, using `EXPLAIN ANALYZE` against a large, prod-shaped Postgres dataset baked into a disposable Docker image.
+A spike for validating that every query in the codebase produces an acceptable query plan cost, using `EXPLAIN ANALYZE` against a large, prod-shaped Postgres dataset baked into a disposable Docker image. Queries are defined as **Drizzle functions in a persistence facade**; the harness gates every one of them by wrapping Drizzle in a driver that EXPLAINs each generated query before it runs.
 
 > Companion doc: [`PLAN.md`](./PLAN.md) is the implementation build sheet. This README is the design rationale (the *why*).
 
@@ -10,7 +10,7 @@ Under a traffic spike (e.g. after a marketing email), the example system can see
 
 ## Approach
 
-Bake a large, prod-shaped dataset into a **Docker image** (post-`VACUUM (FREEZE, ANALYZE)`). Each run spins up a **throwaway container** from that image, runs the query checks (each fully isolated by `BEGIN … ROLLBACK`), and destroys the container. The image *is* the frozen "template".
+Bake a large, prod-shaped dataset into a **Docker image** (post-`VACUUM (FREEZE, ANALYZE)`). Each run spins up a **throwaway container** from that image, runs the query checks (only read paths are gated, so the baked data is never mutated), and destroys the container. The image *is* the frozen "template".
 
 ### Where it runs: Docker
 
@@ -32,7 +32,7 @@ The dataset is built **once, at image build time**, and frozen into the image:
 3. Apply the **generated seed** (`COPY`-based, prod-shaped distribution — see below).
 4. `VACUUM (FREEZE, ANALYZE)` — **load-bearing twice over**: `ANALYZE` captures the planner stats plans depend on; `FREEZE` marks tuples so Postgres won't rewrite their files later for transaction-ID wraparound (which would otherwise dirty "static" files at container runtime and defeat image-layer caching).
 
-**No `CREATE DATABASE ... TEMPLATE` clone.** A container created from the image is already a copy-on-write clone of the baked data (cheaper than Postgres's physical template copy, which is an intra-server file copy). Because every query runs inside `BEGIN … ROLLBACK`, the data is never mutated, so a single baked database stays pristine across the whole run. The template-clone approach was designed for the earlier "tests may mutate data" framing; rollback-per-query supersedes it. (Reintroduce cloning only if you later parallelise, or run something that can't be rolled back.)
+**No `CREATE DATABASE ... TEMPLATE` clone.** A container created from the image is already a copy-on-write clone of the baked data (cheaper than Postgres's physical template copy, which is an intra-server file copy). Because the harness only gates **read** paths, the data is never mutated and a single baked database stays pristine across the whole run. The template-clone approach was designed for the earlier "tests may mutate data" framing; read-only gating supersedes it. (Reintroduce cloning only if you later parallelise, or gate something that mutates.)
 
 **Image versioning.** Tag the image by a content hash of its inputs (migration files + generated seed). The harness reads the image ref from env/config, defaulting to the pinned published tag; a developer who changes schema or seed builds locally under the new hash and the harness picks it up — no code change. This unifies "use the published image" and "use my local build".
 
@@ -49,15 +49,15 @@ Match prod planner configuration too, since these live in config rather than the
 
 ### Per-query execution
 
-Every query — **including `SELECT`s** — is wrapped uniformly:
+Queries are not hand-written SQL strings — they are functions in a **persistence facade** (`src/persistence.ts`) built with Drizzle. The harness wraps Drizzle in a **`pg-proxy` driver** (`test/harness/gate.ts`): every query the facade generates passes through the driver as a parameterised SQL string, and the driver runs
 
 ```sql
-BEGIN;
-EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS) <query with params>;
-ROLLBACK;
+EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS) <generated query with params>
 ```
 
-Uniform wrapping means the harness never needs to classify statements as read vs. write. `EXPLAIN ANALYZE` **executes** the query, so any mutation (including writing CTEs, `SELECT ... FOR UPDATE`, or volatile functions) would otherwise contaminate the data distribution that subsequent queries' plans depend on. The `ROLLBACK` keeps the database pristine for every query.
+against the container, captures the plan, then delegates the real query to node-pg. Calling a facade function is therefore all it takes to gate it — there is no separate catalogue of queries to keep in sync, and Drizzle-generated SQL (joins, `where` clauses, etc.) is covered automatically.
+
+`EXPLAIN ANALYZE` **executes** the query, so the driver only gates **reads** (SELECT/CTE/`TABLE`). Writes and DDL pass straight through un-analysed — analysing them would run the mutation. Reads run outside an explicit transaction; because the dataset is never mutated by the read paths under test, no `BEGIN … ROLLBACK` wrapper is needed to keep it pristine. (A facade function that genuinely mutates should be gated with a plain `EXPLAIN` — no `ANALYZE` — or skipped; see [Coverage](#coverage-and-parameters).)
 
 ### Assertion
 
@@ -74,40 +74,30 @@ Parse the JSON output and gate on two signals, each an optional per-query thresh
 
 ### Coverage and parameters
 
-All queries live in a **folder**, one `.sql` file per query. (Migration scripts live in a *separate* folder and are out of scope for this harness.) Each query's test metadata is embedded **inline in the SQL file** as a single structured block comment, keyed `@test`:
+Every query is an exported function in the **persistence facade** (`src/persistence.ts`). The test (`test/performance.test.ts`) holds a `GATES` map keyed by facade function name; each entry is a list of **cases**. A case either invokes the function with representative arguments and gives a **gate**, or declares a **skip** with a reason:
 
-```sql
-/* @test
-params:
-  - { values: { park_id: 42 }, thresholds: { cost: 250, rowCountRatio: 5 } }
-  - { values: { park_id: 7 },  thresholds: { cost: 900 } }
-*/
-SELECT * FROM bookings WHERE park_id = $1;
+```ts
+const GATES: Record<keyof typeof facade, Case[]> = {
+  parkBookings: [
+    { run: (db) => facade.parkBookings(db, 7, "2025-02-01", "2025-11-30"), gate: { cost: 30000 } },
+  ],
+  vansByGrade: [
+    { run: (db) => facade.vansByGrade(db, "saver"),    gate: { cost: 2000 } },
+    { run: (db) => facade.vansByGrade(db, "platinum"), gate: { cost: 2000 } },
+  ],
+  vacuumReservation: [{ skip: "VACUUM cannot run inside a transaction block" }],
+};
 ```
 
-- **`params`** — parameter sets. The values are part of the test contract, because plans depend on the specific values under data skew. Use **multiple sets per query** where relevant (typical case + worst case), each with its own thresholds. Sets are referenced by **index** in output (e.g. `bookings.sql [param 1]`).
-- **`thresholds`** — per-param-set gates (`cost`, `rowCountRatio`), each optional and falling back to its global default when omitted (`cost` 100, `rowCountRatio` 10). See [Assertion](#assertion). (`Actual Total Time` is reported but not gated.)
+- **cases / arguments** — the argument values are part of the test contract, because plans depend on the specific values under data skew. Use **multiple cases per function** where relevant (typical case + worst case), each with its own gate. Cases are referenced by **index** in output (e.g. `vansByGrade > case 1`).
+- **`gate`** — per-case limits (`cost`, `rowCountRatio`), each optional and falling back to its global default when omitted (`cost` 100, `rowCountRatio` 10). See [Assertion](#assertion). (`Actual Total Time` is reported but not gated.)
+- **`skip`** — a deliberate, reason-bearing opt-out for a function that can't be cost-tested (e.g. `vacuumReservation`: `VACUUM` cannot run inside a transaction block and can't be `EXPLAIN ANALYZE`d). The reason keeps skips auditable rather than quietly accumulating.
 
-**Explicit skip.** Some SQL can't or shouldn't be cost-tested — e.g. a maintenance script like `VACUUM (ANALYZE)`, which **cannot run inside a transaction block** and so can't even go through the `BEGIN … ROLLBACK` wrapper, let alone be planned. Such files carry a `skip` with a **required, non-empty reason** instead of `params`:
+**Why gates in the test, not the facade:** the facade is production code — the app's single database entry point — so it stays free of test concerns. Thresholds and representative arguments are test data and live with the test.
 
-```sql
-/* @test
-skip: "VACUUM cannot run inside a transaction block"
-*/
-VACUUM (ANALYZE) bookings;
-```
+**Coverage detection.** The facade *is* the coverage surface. A dedicated test asserts that **every exported facade function has a `GATES` entry** — a function present in `src/persistence.ts` but absent from `GATES` fails as untested. It can't be silently forgotten: adding a query means adding a facade function, and an ungated facade function turns the suite red.
 
-The reason is mandatory so skips stay auditable — the harness prints a summary of skipped queries so they remain visible rather than quietly accumulating. Skip is a deliberate, reason-bearing opt-out; it is **not** the same as a missing block (which is a failure).
-
-**Why inline over sidecar files:** the test contract lives exactly where the query does, so it can't drift away from or be orphaned from the query, and it keeps the file count down. The `.sql` file remains runnable as-is — Postgres ignores comments.
-
-**Why a single structured block over scattered `-- @key value` lines:** the metadata is structured data (a list of records), not scalars. Embedding one YAML/JSON block and handing it to a real parser avoids inventing a fragile bespoke comment DSL. Postgres supports `/* ... */` block comments (they even nest), so the whole payload sits in one comment and the file still runs unchanged.
-
-**Coverage detection.** Because every query file exists regardless of whether it's tested, coverage is no longer "does a sibling file exist?" — it's "does this file contain a valid, parseable `@test` block?". The parser must be **strict**:
-
-- No `@test` block → untested → **fail**.
-- `@test` block with neither `params` nor `skip`, or otherwise malformed/empty → broken test → **fail loudly** (distinct from untested; never silently pass or count as untested).
-- `@test` with a valid `skip: "<reason>"` → recorded as skipped and reported in the summary.
+This is the key advantage over externalised `.sql` files: there is no way to write a query that the harness doesn't see. Any query the app can run goes through the facade, and every facade function must be gated.
 
 ### Plan mode: custom plans only
 
@@ -124,17 +114,17 @@ BUILD (once, offline):
 
 RUN:
   start throwaway container from the baked image
-  discover queries/*.sql  → assert every file has a valid @test block (coverage)
-  for each query file:
-    parse inline @test block  (skip → record & continue; missing/malformed → fail)
-    for each param set:
-      BEGIN
-      EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS) <query> with param values
+  assert every exported facade function has a GATES entry  (coverage)
+  for each facade function in GATES:
+    for each case:
+      skip → record & continue
+      call facade.fn(gatedDb, ...args)
+        → pg-proxy driver runs EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS) on the
+          generated SQL, captures the plan, then delegates the real query
       parse JSON → Total Cost, Plan/Actual Rows, Actual Total Time
-      assert cost <= thresholds.cost                     (default 100)
-      assert rowCountRatio <= thresholds.rowCountRatio   (default 10)
+      assert cost <= gate.cost                     (default 100)
+      assert rowCountRatio <= gate.rowCountRatio   (default 10)
       report Actual Total Time  (diagnostic only, not asserted)
-      ROLLBACK
   destroy container
 ```
 

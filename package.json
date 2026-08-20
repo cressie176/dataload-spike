@@ -25,7 +25,6 @@
     "@types/pg": "^8.11.10",
     "drizzle-kit": "^0.31.1",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2",
-    "yaml": "^2.6.1"
+    "typescript": "^5.7.2"
   }
 }
