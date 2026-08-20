@@ -1,4 +1,4 @@
-import type { PoolClient } from "pg";
+import type { Pool, PoolClient } from "pg";
 
 /**
  * Runs one param set under `BEGIN; EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS) <q>; ROLLBACK;`
@@ -28,27 +28,27 @@ export function orderedParams(values: Record<string, unknown>): unknown[] {
   return Object.values(values);
 }
 
-export async function explainOne(client: PoolClient, sql: string, params: unknown[]): Promise<PlanResult> {
+export function planFromExplainRow(queryPlan: { Plan: PlanNode }[]): PlanResult {
+  const top = queryPlan[0].Plan;
+  const totalCost = top["Total Cost"];
+  const planRows = top["Plan Rows"];
+  const actualRows = top["Actual Rows"];
+  const actualTotalTimeMs = top["Actual Total Time"];
+
+  // Guard the 0-row case: a ratio of x/0 is meaningless. Treat "both 0" as a
+  // perfect estimate (ratio 1); if only one side is 0, clamp the other to 1.
+  const hi = Math.max(actualRows, planRows);
+  const lo = Math.min(actualRows, planRows);
+  const rowCountRatio = hi === 0 ? 1 : hi / Math.max(lo, 1);
+
+  return { totalCost, planRows, actualRows, actualTotalTimeMs, rowCountRatio };
+}
+
+export async function explainOne(client: PoolClient | Pool, sql: string, params: unknown[]): Promise<PlanResult> {
   await client.query("BEGIN");
   try {
-    const wrapped = `EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS) ${sql}`;
-    const res = await client.query(wrapped, params);
-    // FORMAT JSON → single row, single column ("QUERY PLAN"), an array of one plan.
-    const planWrapper = res.rows[0]["QUERY PLAN"][0];
-    const top = planWrapper.Plan as PlanNode;
-
-    const totalCost = top["Total Cost"];
-    const planRows = top["Plan Rows"];
-    const actualRows = top["Actual Rows"];
-    const actualTotalTimeMs = top["Actual Total Time"];
-
-    // Guard the 0-row case: a ratio of x/0 is meaningless. Treat "both 0" as a
-    // perfect estimate (ratio 1); if only one side is 0, clamp the other to 1.
-    const hi = Math.max(actualRows, planRows);
-    const lo = Math.min(actualRows, planRows);
-    const rowCountRatio = hi === 0 ? 1 : hi / Math.max(lo, 1);
-
-    return { totalCost, planRows, actualRows, actualTotalTimeMs, rowCountRatio };
+    const res = await client.query(`EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS) ${sql}`, params);
+    return planFromExplainRow(res.rows[0]["QUERY PLAN"]);
   } finally {
     await client.query("ROLLBACK");
   }
