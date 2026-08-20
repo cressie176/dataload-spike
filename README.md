@@ -1,80 +1,67 @@
 # Query Cost Test Harness — Spike
 
-A spike for validating that every query in the codebase produces an acceptable query plan cost, using `EXPLAIN ANALYZE` against a large, prod-shaped Postgres dataset baked into a disposable Docker image. Queries are defined as **Drizzle functions in a persistence facade**; the harness gates every one of them by wrapping Drizzle in a driver that EXPLAINs each generated query before it runs.
+Validates that every query in the codebase produces an acceptable query plan, by running `EXPLAIN ANALYZE` against a large, prod-shaped Postgres dataset baked into a disposable Docker image. Queries are Drizzle functions in a persistence facade; the harness gates them by wrapping Drizzle in a driver that EXPLAINs each generated query before it runs.
 
-> Companion doc: [`PLAN.md`](./PLAN.md) is the implementation build sheet. This README is the design rationale (the *why*).
+See [`PLAN.md`](./PLAN.md) for the build sheet. This is the design rationale.
 
 ## Goal
 
-Under a traffic spike (e.g. after a marketing email), the example system can see **thousands of concurrent users at once**. At that concurrency a single bad query plan (e.g. an unexpected sequential scan on a hot table) is catastrophic, whereas query *planning* overhead is negligible. This harness targets **plan quality**: it runs every query, captures its cost, and fails any query whose cost exceeds an acceptable threshold.
+Under a traffic spike (e.g. a marketing email) the system can see thousands of concurrent users. At that concurrency a single bad plan — an unexpected seq scan on a hot table — is catastrophic, while planning overhead is negligible. So the harness targets plan *quality*: run every query, capture its cost, fail anything over threshold.
 
-## Approach
+## Where it runs: Docker
 
-Bake a large, prod-shaped dataset into a **Docker image** (post-`VACUUM (FREEZE, ANALYZE)`). Each run spins up a **throwaway container** from that image, runs the query checks (only read paths are gated, so the baked data is never mutated), and destroys the container. The image *is* the frozen "template".
+The harness runs against a Docker Postgres, locally and (later) in CI. Provisioning RDS per developer and per pipeline run would be slow, costly, and a teardown burden; Docker gives everyone an identical, disposable instance in seconds.
 
-### Where it runs: Docker
+Plan fidelity doesn't depend on the infrastructure — a container produces the same plans as RDS. What matters for parity:
 
-The harness runs against a **Docker Postgres**, both **locally** and (later) in **CI/CD**. It must be fast, free, and ephemeral in both places — provisioning RDS per developer and per pipeline run would be slow, costly, and a credentials/teardown burden. Docker gives every developer and the pipeline an identical, disposable instance in seconds.
+- **Pin the Postgres major version** (the planner changes between majors). This POC pins `postgres:18`; match prod's major when picking a real target.
+- **Mirror prod's planner GUCs** — `random_page_cost`, `work_mem`, `effective_cache_size`, `default_statistics_target`.
 
-Plan/cost fidelity does **not** depend on the infrastructure — RDS is just Postgres, and a container produces identical plans. Parity that matters comes from:
+`cost` and `rowCountRatio` are hardware-independent, so they're trustworthy anywhere. `Actual Total Time` is not (see [Gates](#gates)).
 
-- **Pinning the image to prod's Postgres major version** (planner behaviour changes between majors). This POC pins `postgres:18`.
-- **Mirroring prod's planner GUCs** — `random_page_cost`, `work_mem`, `effective_cache_size`, `default_statistics_target`.
+## Provisioning: bake once into an image
 
-`cost` and `rowCountRatio` are **hardware-independent** and therefore trustworthy in any environment. `Actual Total Time` is **hardware-sensitive** — numbers differ between a laptop and a CI runner and won't reflect prod latency — so it is captured and reported but never gated (see [Assertion](#assertion)).
+The dataset is built once at image build time and frozen in:
 
-### Provisioning: bake once into an image, no template clone
+1. `initdb` into a **non-volume `PGDATA`**. The official image declares the default data dir a `VOLUME`, and build-time writes to a VOLUME are discarded — so bake elsewhere.
+2. Apply the **Drizzle-generated migrations** (the same artifacts a deploy uses — doubles as a migration smoke-test).
+3. Apply the **generated seed** (`COPY`-based, prod-shaped — see below).
+4. `VACUUM (FREEZE, ANALYZE)`. `ANALYZE` captures the planner stats; `FREEZE` stops Postgres rewriting tuple files later for txid wraparound, which would otherwise dirty "static" files at runtime and break layer caching.
 
-The dataset is built **once, at image build time**, and frozen into the image:
+**No `TEMPLATE` clone.** A container from the image is already a copy-on-write clone of the baked data. The harness only gates reads, so the data never mutates and one baked database stays pristine for the whole run. (Add cloning only if you parallelise or gate something that mutates.)
 
-1. `initdb` a fresh cluster into a **non-volume `PGDATA`** (e.g. `/var/lib/postgresql/baked`). The official `postgres` image declares the default data dir a `VOLUME`, and build-time writes to a VOLUME path are discarded — so we bake into a non-volume path.
-2. Apply the **Drizzle-generated migration scripts** (same artifacts a real deploy would use) — this doubles as a migration smoke-test.
-3. Apply the **generated seed** (`COPY`-based, prod-shaped distribution — see below).
-4. `VACUUM (FREEZE, ANALYZE)` — **load-bearing twice over**: `ANALYZE` captures the planner stats plans depend on; `FREEZE` marks tuples so Postgres won't rewrite their files later for transaction-ID wraparound (which would otherwise dirty "static" files at container runtime and defeat image-layer caching).
+**Image versioning.** Tag by a content hash of the inputs (migrations + seed). The harness reads the image ref from config, defaulting to the published tag; change the schema or seed and you build locally under a new hash that the harness picks up automatically.
 
-**No `CREATE DATABASE ... TEMPLATE` clone.** A container created from the image is already a copy-on-write clone of the baked data (cheaper than Postgres's physical template copy, which is an intra-server file copy). Because the harness only gates **read** paths, the data is never mutated and a single baked database stays pristine across the whole run. The template-clone approach was designed for the earlier "tests may mutate data" framing; read-only gating supersedes it. (Reintroduce cloning only if you later parallelise, or gate something that mutates.)
+## Seed data distribution
 
-**Image versioning.** Tag the image by a content hash of its inputs (migration files + generated seed). The harness reads the image ref from env/config, defaulting to the pinned published tag; a developer who changes schema or seed builds locally under the new hash and the harness picks it up — no code change. This unifies "use the published image" and "use my local build".
+The planner's choices depend on the *shape* of the data — `n_distinct`, MCVs, histogram bounds, `null_frac`, correlation — not just row counts. Uniform synthetic data produces plans that diverge from prod, so the seed approximates prod cardinality and skew.
 
-### Seed data distribution
+## Queries: the persistence facade
 
-The planner's choices depend on the statistical shape of the data — `n_distinct`, most-common-values, histogram bounds, `null_frac`, and physical/logical correlation — not just row counts. Uniform synthetic data can produce plans that diverge from prod. The seed process should approximate **prod cardinality and skew**.
-
-Match prod planner configuration too, since these live in config rather than the template:
-
-- `random_page_cost`
-- `work_mem`
-- `effective_cache_size`
-- `default_statistics_target`
-
-### Per-query execution
-
-Queries are not hand-written SQL strings — they are functions in a **persistence facade** (`src/persistence.ts`) built with Drizzle. The harness wraps Drizzle in a **`pg-proxy` driver** (`test/harness/gate.ts`): every query the facade generates passes through the driver as a parameterised SQL string, and the driver runs
+Queries are functions in a persistence facade (`src/persistence.ts`), built with Drizzle. The harness wraps Drizzle in a `pg-proxy` driver (`test/harness/gate.ts`): every query the facade generates passes through the driver as a parameterised string, which runs
 
 ```sql
-EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS) <generated query with params>
+EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS) <generated query>
 ```
 
-against the container, captures the plan, then delegates the real query to node-pg. Calling a facade function is therefore all it takes to gate it — there is no separate catalogue of queries to keep in sync, and Drizzle-generated SQL (joins, `where` clauses, etc.) is covered automatically.
+captures the plan, then delegates the real query to node-pg. Calling a facade function is all it takes to gate it — there's no separate catalogue to keep in sync, and Drizzle-generated SQL (joins, `where` clauses) is covered automatically.
 
-`EXPLAIN ANALYZE` **executes** the query, so the driver only gates **reads** (SELECT/CTE/`TABLE`). Writes and DDL pass straight through un-analysed — analysing them would run the mutation. Reads run outside an explicit transaction; because the dataset is never mutated by the read paths under test, no `BEGIN … ROLLBACK` wrapper is needed to keep it pristine. (A facade function that genuinely mutates should be gated with a plain `EXPLAIN` — no `ANALYZE` — or skipped; see [Coverage](#coverage-and-parameters).)
+`EXPLAIN ANALYZE` *executes* the query, so the driver only gates reads (SELECT/CTE/`TABLE`); writes and DDL pass through un-analysed. A facade function that mutates should use a plain `EXPLAIN` or be skipped.
 
-### Assertion
+## Gates
 
-Parse the JSON output and gate on two signals, each an optional per-query threshold (see [Coverage and parameters](#coverage-and-parameters)):
+Parse the plan JSON and gate on two signals:
 
-- **`cost`** — top-node `Total Cost` (planner estimate, arbitrary units). Global default **100**, overridable per param set. This is a **"worth checking" tripwire, not a pass target**: a query under 100 is unlikely to cause a production issue and passes silently; a query over 100 is flagged as worth a human look — either optimise it, or acknowledge it's fine with an explicit per-query override. Expect a meaningful fraction of queries to need overrides; that's the mechanism working, not failing.
-- **`rowCountRatio`** — **row mis-estimate ratio**: `max(Actual Rows, Plan Rows) / min(Actual Rows, Plan Rows)`, i.e. "the planner was off by Nx". Global default **10**, overridable per param set. This is a *tolerance*, not a target: a coarse tripwire for the planner being badly wrong, which is the strongest signal of stale/inaccurate statistics behind a bad plan.
+- **`cost`** — top-node `Total Cost`. Default **100**. A "worth checking" tripwire, not a pass target: under 100 passes silently, over 100 is flagged for a human to either optimise or explicitly override. Expect a fair number of overrides — that's the mechanism working.
+- **`rowCountRatio`** — `max(Actual, Plan) / min(Actual, Plan)`, i.e. how many x the planner was off. Default **10**. A coarse tripwire for bad stats behind a bad plan.
 
-`cost` flags queries expensive enough to be worth checking; `rowCountRatio` catches the root cause of most bad plans (stale stats behind a bad estimate). Together they cover the dominant failure mode for this workload.
+The ratio (not absolute row counts) means proportional data growth doesn't cause churn — estimate and actual scale together; the ratio only moves when the data changes *shape*, which is when plans flip. 10 is a starting point: multi-join queries legitimately compound estimation error, so loosen it if it proves flaky, and ratchet toward the tightest non-noisy value.
 
-**Why a *ratio*, and why loose:** gating on the ratio (not absolute row counts) means proportional data growth doesn't cause churn — estimate and actual scale together, so the ratio holds; it only moves when the data changes *shape*, which is exactly when plans flip. The default of 10 is a starting point: healthy multi-join queries can legitimately mis-estimate by several x (errors compound up a join tree), so **if 10 proves flaky on real seed data, loosen it (or override the offending queries) promptly** rather than letting failures get ignored. Ratchet toward the tightest value that isn't noisy.
+**`Actual Total Time` is reported but not gated** — it's hardware-sensitive, so it'd be flaky on CI and toothless on a fast laptop. Still worth surfacing: a query that passes cost/ratio but runs slow is a signal for a human to look (e.g. a `work_mem` spill the cost model doesn't capture).
 
-**`Actual Total Time` is captured and reported, but not asserted on.** It's hardware-sensitive — a value that's stable and meaningful on prod hardware would be flaky on a CI runner and toothless on a fast laptop — so it can't be a reliable gate here (Docker, locally + CI). It's still worth surfacing in the run output as a diagnostic: if a query passes on `cost`/`rowCountRatio` but took surprisingly long, that's a signal for a human to investigate (e.g. an expensive function or a `work_mem` spill the cost model doesn't represent).
+## Coverage
 
-### Coverage and parameters
-
-Every query is an exported function in the **persistence facade** (`src/persistence.ts`). The test (`test/performance.test.ts`) holds a `GATES` map keyed by facade function name; each entry is a list of **cases**. A case either invokes the function with representative arguments and gives a **gate**, or declares a **skip** with a reason:
+The facade *is* the coverage surface. The test (`test/performance.test.ts`) holds a `GATES` map keyed by facade function; each entry is a list of cases that either invoke the function with representative args and a gate, or declare a skip:
 
 ```ts
 const GATES: Record<keyof typeof facade, Case[]> = {
@@ -89,54 +76,47 @@ const GATES: Record<keyof typeof facade, Case[]> = {
 };
 ```
 
-- **cases / arguments** — the argument values are part of the test contract, because plans depend on the specific values under data skew. Use **multiple cases per function** where relevant (typical case + worst case), each with its own gate. Cases are referenced by **index** in output (e.g. `vansByGrade > case 1`).
-- **`gate`** — per-case limits (`cost`, `rowCountRatio`), each optional and falling back to its global default when omitted (`cost` 100, `rowCountRatio` 10). See [Assertion](#assertion). (`Actual Total Time` is reported but not gated.)
-- **`skip`** — a deliberate, reason-bearing opt-out for a function that can't be cost-tested (e.g. `vacuumReservation`: `VACUUM` cannot run inside a transaction block and can't be `EXPLAIN ANALYZE`d). The reason keeps skips auditable rather than quietly accumulating.
+- **Arguments** are part of the contract — plans depend on the specific values under skew. Use multiple cases (typical + worst) where it matters.
+- **`gate`** — per-case `cost`/`rowCountRatio`, each falling back to the default when omitted.
+- **`skip`** — a reason-bearing opt-out for a function that can't be cost-tested. The reason keeps skips auditable.
 
-**Why gates in the test, not the facade:** the facade is production code — the app's single database entry point — so it stays free of test concerns. Thresholds and representative arguments are test data and live with the test.
+Gates live in the test, not the facade: the facade is production code, so thresholds and test arguments stay out of it.
 
-**Coverage detection.** The facade *is* the coverage surface. A dedicated test asserts that **every exported facade function has a `GATES` entry** — a function present in `src/persistence.ts` but absent from `GATES` fails as untested. It can't be silently forgotten: adding a query means adding a facade function, and an ungated facade function turns the suite red.
+A dedicated test asserts **every exported facade function has a `GATES` entry** — an ungated function fails as untested. This is the advantage over externalised `.sql` files: a query can't exist outside the facade, and no facade function can escape gating.
 
-This is the key advantage over externalised `.sql` files: there is no way to write a query that the harness doesn't see. Any query the app can run goes through the facade, and every facade function must be gated.
+## Custom plans only
 
-### Plan mode: custom plans only
+The harness validates custom (value-aware) plans, matching the assumed prod setup: the app uses node-pg on its default unnamed query path, so Postgres replans per execution with actual values and never switches to a generic plan. Revisit only if `name:` in `.query()` call sites reveals named prepared statements, which flip custom→generic after ~5 executions.
 
-The harness validates **custom** (value-aware) plans, which matches the assumed production setup: the app uses **node-pg on its default unnamed query path**, so Postgres replans every execution with the actual parameter values and never switches to a value-blind generic plan. No `force_generic_plan` handling is required.
-
-> Revisit only if a grep for `name:` in `.query(` call sites reveals **named prepared statements** — those are subject to the custom→generic plan switch after ~5 executions and would need separate treatment.
-
-## Per-query sequence
+## Sequence
 
 ```
 BUILD (once, offline):
-  initdb → apply migrations → apply seed → VACUUM (FREEZE, ANALYZE)
+  initdb → migrations → seed → VACUUM (FREEZE, ANALYZE)
   → bake into image, tag by content hash of (migrations + seed)
 
 RUN:
-  start throwaway container from the baked image
-  assert every exported facade function has a GATES entry  (coverage)
-  for each facade function in GATES:
-    for each case:
-      skip → record & continue
-      call facade.fn(gatedDb, ...args)
-        → pg-proxy driver runs EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS) on the
-          generated SQL, captures the plan, then delegates the real query
-      parse JSON → Total Cost, Plan/Actual Rows, Actual Total Time
-      assert cost <= gate.cost                     (default 100)
-      assert rowCountRatio <= gate.rowCountRatio   (default 10)
-      report Actual Total Time  (diagnostic only, not asserted)
+  start throwaway container
+  assert every facade function has a GATES entry
+  for each function, for each case:
+    skip → record & continue
+    call facade.fn(gatedDb, ...args)
+      → driver EXPLAINs the generated SQL, captures the plan, runs the real query
+    assert cost <= gate.cost               (default 100)
+    assert rowCountRatio <= gate.ratio     (default 10)
+    report Actual Total Time               (diagnostic only)
   destroy container
 ```
 
 ## Future scaling
 
-None of this is needed at POC scale (~300–500MB image), but the reasoning is captured so it isn't lost.
+Not needed at POC scale (~300–500MB image), captured so it isn't lost.
 
-- **Never make the seed additive.** Schema migrations are legitimately forward-only deltas — they replay against real databases that already hold data you can't discard. The **seed is different**: it's a disposable build input that only ever populates a throwaway image, so it should be a **regenerated single-state snapshot**, not an accumulating chain of `seed_0001`, `seed_0002`, … Additive seed deltas would grow the build inputs without bound just to produce the same end-state. Keep the two disciplines separate: migrations accrete, seed regenerates.
-- **Tablespace-per-layer for large static reference data.** Docker layer diffs are whole-file (overlayfs copy-up), and Postgres rewrites files behind your back (vacuum, freeze, hint-bit-on-first-read) — so a naive "ship only the changed rows as a delta layer" doesn't work. The lever that does: put stable reference tables (park, pitch, van) on a **tablespace** written in an *early* build layer, fully `VACUUM (FREEZE, ANALYZE)`'d so nothing rewrites them afterward; put churning tables on a *later* layer. The static layer stays cached and only the churning layer re-downloads. Caveat: `pg_statistic` and the rest of the catalog live in the default tablespace, so a small catalog delta remains even when the static *data* doesn't change.
-- **The version that really pays off: partition reservations by season onto per-season tablespaces.** Reservations are append-mostly — a closed season never changes again. Aligning the layer boundary with Postgres's real mutation boundary (the current season) means each past season becomes a permanent cached layer, and only the current season's layer rebuilds. This is the sound realisation of the "just ship the deltas" instinct — it works precisely because it follows Postgres's own immutability boundary instead of fighting it.
-- **Registry bloat is a retention problem, not a fundamental one.** Each image tag is an independent set of layers; old data accumulates only if you keep old tags. Solve it with a GC/lifecycle policy (keep last N tags) plus optional squashing — not by changing the bake approach.
+- **Never make the seed additive.** Migrations are forward-only deltas because they replay against real data. The seed only populates a throwaway image, so it's a regenerated single-state snapshot — additive seed deltas would grow the build inputs without bound to reach the same end-state.
+- **Tablespace-per-layer for static reference data.** Docker layer diffs are whole-file, and Postgres rewrites files behind your back (vacuum, freeze, hint bits), so "ship only the changed rows" doesn't work. Instead put stable tables (park, pitch, van) on a tablespace in an early, fully-frozen layer and churning tables in a later one; the static layer stays cached. (The catalog lives in the default tablespace, so a small delta remains.)
+- **Partition reservations by season onto per-season tablespaces.** Reservations are append-mostly and closed seasons never change, so aligning the layer boundary with the current season makes each past season a permanent cached layer and rebuilds only the current one.
+- **Registry bloat is a retention problem.** Each tag is independent layers; solve with a keep-last-N lifecycle policy, not by changing the bake.
 
 ## Open questions
 
-- Whether the harness should also build from **prod-shaped existing data** — validating that migrations correctly migrate *existing* data, not just that they apply cleanly to an empty database. Out of scope for this POC.
+- Whether to also build from prod-shaped *existing* data, to validate that migrations transform existing rows correctly rather than just applying to an empty DB. Out of scope for this POC.
