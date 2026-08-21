@@ -9,14 +9,18 @@ same 4.14M-row dataset loaded four ways, schema reset between runs).
 
 ## Results
 
+One representative run (host load causes run-to-run variance of a second or so;
+the ordering is stable):
+
 | Method | Wall-clock | Speedup |
 |--------|-----------:|--------:|
-| A) serial COPY (`seed.sql`) | 24.3 s | 1.0× |
-| B) parallel COPY `-j4`, logged | 10.9 s | 2.2× |
-| C) parallel COPY `-j8`, logged | 9.6 s | 2.5× |
-| D) parallel COPY `-j8`, **unlogged** | 6.6 s | 3.7× |
+| A) serial COPY (`seed.sql`) | 27.6 s | 1.0× |
+| B) parallel COPY `-j4`, logged | 12.2 s | 2.3× |
+| C) parallel COPY `-j8`, logged | 11.4 s | 2.4× |
+| D) parallel COPY `-j8`, **unlogged** | 8.1 s | 3.4× |
+| E) D + drop/rebuild secondary indexes | 7.7 s | 3.6× |
 
-All four produced identical row counts (40 parks, 47,328 pitches/vans,
+All five produced identical row counts (40 parks, 47,328 pitches/vans,
 4,140,391 reservations) — the partition-by-park split loads the same data.
 
 ## Findings
@@ -32,13 +36,18 @@ generation cost and the chunks are byte-consistent with the monolith.
 Going -j4 → -j8 added only ~14% (2.2× → 2.5×): doubling workers barely helped,
 so past ~4 workers we're not CPU-bound — the parallel COPY streams serialize on
 a shared resource. Turning WAL off (unlogged, method D) at the SAME -j8 cut
-another 31% (9.6 s → 6.6 s, 2.5× → 3.7×). That delta is the WAL cost: WAL was
+another 29% (11.4 s → 8.1 s, 2.4× → 3.4×). That delta is the WAL cost: WAL was
 the dominant bottleneck capping the logged parallel runs, exactly as expected —
 every worker funnels through the same WAL flush path.
 
-Index maintenance is the remaining shared cost (all four tables are indexed from
-the migration, so concurrent COPY contends on index inserts). Dropping and
-recreating indexes around the load is a separate, additive lever not tested here.
+### Dropping indexes for the load isn't worth it (once WAL is off)
+Method E drops the five secondary indexes, loads index-free, then bulk-rebuilds
+them — timed end-to-end. It came in at 7.7 s vs D's 8.1 s: only ~5% faster. The
+index-free COPY is genuinely quicker, but the bulk `CREATE INDEX` pass pays most
+of that saving straight back. Once WAL is off, index maintenance is a minor cost
+on this dataset, not a real lever — and drop/rebuild adds moving parts (index
+DDL must be kept in sync with the migration by hand). Not adopted. It would only
+start to pay if the index set grew much heavier relative to the row payload.
 
 ### Why partition by park (root aggregate), not "entities then relationships"
 The FK graph is a chain, so children need parent IDs. Generating entities

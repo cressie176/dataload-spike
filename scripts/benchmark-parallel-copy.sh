@@ -12,7 +12,9 @@
 #   B) parallel COPY  -j4     parallel psql -f chunk      (logged tables)
 #   C) parallel COPY  -j8     parallel psql -f chunk      (logged tables)
 #   D) parallel COPY  -j8     parallel psql -f chunk      (UNLOGGED tables)
+#   E) parallel COPY  -j8     unlogged + drop/rebuild secondary indexes
 # D vs C isolates the WAL cost: same parallelism, WAL turned off.
+# E vs D isolates index-maintenance cost: load index-free, rebuild after (timed).
 #
 # Requires: seed.sql + chunks/ (run `npm run generate:seed` first) and GNU parallel.
 set -euo pipefail
@@ -72,6 +74,20 @@ set_unlogged() {
   psql_run -c "ALTER TABLE reservation SET UNLOGGED; ALTER TABLE van SET UNLOGGED; ALTER TABLE pitch SET UNLOGGED; ALTER TABLE park SET UNLOGGED;" >/dev/null
 }
 
+# The five secondary indexes from migration 0000 (PKs and FK-referenced unique
+# constraints are left in place — dropping those would need the FKs gone too).
+drop_indexes() {
+  psql_run -c "DROP INDEX pitch_park_id_idx, reservation_van_id_idx, reservation_dates_idx, van_pitch_id_idx, van_grade_idx;" >/dev/null
+}
+
+rebuild_indexes() {
+  psql_run -c "CREATE INDEX pitch_park_id_idx ON pitch USING btree (park_id);
+               CREATE INDEX reservation_van_id_idx ON reservation USING btree (van_id);
+               CREATE INDEX reservation_dates_idx ON reservation USING btree (start_date, end_date);
+               CREATE INDEX van_pitch_id_idx ON van USING btree (pitch_id);
+               CREATE INDEX van_grade_idx ON van USING btree (grade);" >/dev/null
+}
+
 rowcounts() {
   psql_run -tA -c "SELECT t||'='||c FROM (SELECT 'park' t, count(*) c FROM park UNION ALL SELECT 'pitch', count(*) FROM pitch UNION ALL SELECT 'van', count(*) FROM van UNION ALL SELECT 'reservation', count(*) FROM reservation) s;" | tr '\n' ' '
 }
@@ -122,6 +138,17 @@ set_unlogged
 D_SECS=$(time_it parallel_load 8)
 D_COUNTS=$(rowcounts)
 
+# ---- E) parallel COPY -j8 (unlogged + drop/rebuild secondary indexes) ----
+# Timed end-to-end: drop indexes → load index-free → rebuild indexes → finalize.
+# The rebuild is a bulk CREATE INDEX (uses maintenance_work_mem in one pass)
+# instead of page-splitting under concurrent COPY.
+echo ">> [E] parallel COPY -j8 (unlogged + drop/rebuild indexes)"
+reset_schema
+set_unlogged
+load_no_indexes() { drop_indexes; parallel_load 8; rebuild_indexes; }
+E_SECS=$(time_it load_no_indexes)
+E_COUNTS=$(rowcounts)
+
 fmt() { printf '%.2f' "$1"; }
 mult() { echo "scale=2; $A_SECS / $1" | bc; }
 
@@ -131,6 +158,7 @@ printf 'A) serial COPY          : %7s s   [%s]\n' "$(fmt "$A_SECS")" "$A_COUNTS"
 printf 'B) parallel -j4 logged  : %7s s   [%s]  %sx\n' "$(fmt "$B_SECS")" "$B_COUNTS" "$(mult "$B_SECS")"
 printf 'C) parallel -j8 logged  : %7s s   [%s]  %sx\n' "$(fmt "$C_SECS")" "$C_COUNTS" "$(mult "$C_SECS")"
 printf 'D) parallel -j8 UNLOGGED : %7s s   [%s]  %sx\n' "$(fmt "$D_SECS")" "$D_COUNTS" "$(mult "$D_SECS")"
+printf 'E) D + drop/rebuild idx  : %7s s   [%s]  %sx\n' "$(fmt "$E_SECS")" "$E_COUNTS" "$(mult "$E_SECS")"
 echo "-------------------------------------------------------"
-printf 'speedup vs serial = A/method.  D vs C isolates the WAL cost at -j8.\n'
+printf 'speedup vs serial = A/method.  D vs C isolates WAL; E vs D isolates index maintenance.\n'
 echo "======================================================="
