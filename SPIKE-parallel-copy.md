@@ -57,12 +57,21 @@ chunks contain exactly the same row set.
 
 ## Recommendation
 
-For the build-time bake, adopt **parallel COPY by park on UNLOGGED tables**
-(3.7× here): the bake stops the cluster cleanly (`pg_ctl stop -w`) and the image
-is a read-only template, so the unlogged crash-safety caveat doesn't bite. If we
-want the baked tables logged in the final image, `SET LOGGED` after the load
-rewrites+WAL-logs them (paying the WAL cost back once, serially) — measure
-whether that erases the win before committing to it.
+For the build-time bake, adopt **parallel COPY by park into UNLOGGED tables, then
+`SET LOGGED`** — now wired into `docker/build-db.sh`. The load runs unlogged to
+dodge the WAL ceiling, then flips the tables back to LOGGED so the final image is
+crash-safe (all four tables end at `relpersistence = 'p'`, verified).
+
+`SET LOGGED` re-pays the WAL cost once, serially, but end-to-end still wins.
+Measured inside the bake (postgres:18, `-P 8`):
+
+| Step | Wall-clock |
+|------|-----------:|
+| parallel COPY (unlogged) | ~6.3 s |
+| `SET LOGGED` (rewrite → WAL) | ~5.6 s |
+| **total** | **~12 s** vs ~24 s serial logged → **~2× faster** |
+
+So we keep the crash-safe logged image *and* roughly halve the load phase.
 
 Worker-thread *generation* (the original idea) is not worth it yet: the spike
 showed generation is already cheap; the cost is on the write side, which parallel

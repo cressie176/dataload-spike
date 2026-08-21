@@ -77,8 +77,29 @@ for f in $(ls /work/migrations/*.sql | sort); do
   run_sql "$DB_NAME" "$f"
 done
 
-step "seed load (COPY)"
-run_sql "$DB_NAME" /work/seed.sql
+# Seed load: parallel COPY, one independent chunk per park (see SPIKE-parallel-copy.md).
+# Park subtrees never reference each other, so the chunks COPY concurrently with no
+# join-up pass. We load into UNLOGGED tables (WAL is the bottleneck that caps parallel
+# COPY — unlogged skips it) then flip them back to LOGGED so the final image is
+# crash-safe. Sequence resets are global, so _finalize.sql runs once after all chunks.
+JOBS="${SEED_LOAD_JOBS:-$(nproc)}"
+
+step "seed load (parallel COPY, -P $JOBS, unlogged)"
+su postgres -c "psql -v ON_ERROR_STOP=1 --username=$DB_USER --dbname=$DB_NAME -c \
+  'ALTER TABLE reservation SET UNLOGGED; ALTER TABLE van SET UNLOGGED; ALTER TABLE pitch SET UNLOGGED; ALTER TABLE park SET UNLOGGED;'"
+
+# GNU xargs -P runs $JOBS psql processes concurrently, each COPYing one park chunk
+# over the local socket. ON_ERROR_STOP + set -e means any chunk failure aborts the build.
+ls /work/chunks/park-*.sql | xargs -P "$JOBS" -I {} \
+  su postgres -c "psql -v ON_ERROR_STOP=1 --username=$DB_USER --dbname=$DB_NAME -f {}"
+
+step "SET LOGGED (rewrites tables into WAL for a crash-safe image)"
+su postgres -c "psql -v ON_ERROR_STOP=1 --username=$DB_USER --dbname=$DB_NAME -c \
+  'ALTER TABLE park SET LOGGED; ALTER TABLE pitch SET LOGGED; ALTER TABLE van SET LOGGED; ALTER TABLE reservation SET LOGGED;'"
+
+step "finalize (sequence resets)"
+run_sql "$DB_NAME" /work/chunks/_finalize.sql
+
 step "seed loaded — row counts:"
 su postgres -c "psql --username=$DB_USER --dbname=$DB_NAME -c \
   \"SELECT 'park' t, count(*) FROM park UNION ALL SELECT 'pitch', count(*) FROM pitch UNION ALL SELECT 'van', count(*) FROM van UNION ALL SELECT 'reservation', count(*) FROM reservation;\""

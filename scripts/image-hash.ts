@@ -26,13 +26,19 @@ for (const f of migrationFiles) {
   hash.update(readFileSync(join(migrationsDir, f)));
 }
 
-// Generated seed.
-const seedPath = join(ROOT, "seed.sql");
-if (!existsSync(seedPath)) {
-  console.error("seed.sql not found — run `npm run generate:seed` first.");
+// Generated seed chunks (one per park + _finalize.sql), in stable name order.
+const chunkDir = join(ROOT, "chunks");
+if (!existsSync(chunkDir)) {
+  console.error("chunks/ not found — run `npm run generate:seed` first.");
   process.exit(1);
 }
-hash.update(readFileSync(seedPath));
+const chunkFiles = readdirSync(chunkDir)
+  .filter((f) => f.endsWith(".sql"))
+  .sort();
+for (const f of chunkFiles) {
+  hash.update(f);
+  hash.update(readFileSync(join(chunkDir, f)));
+}
 
 const digest = hash.digest("hex").slice(0, 12);
 process.stdout.write(`parkdata:${digest}\n`);
