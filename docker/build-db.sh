@@ -79,21 +79,43 @@ done
 
 # Seed load: parallel COPY, one independent chunk per park (see SPIKE-parallel-copy.md).
 # Park subtrees never reference each other, so the chunks COPY concurrently with no
-# join-up pass. We load into UNLOGGED tables (WAL is the bottleneck that caps parallel
-# COPY — unlogged skips it) then flip them back to LOGGED so the final image is
-# crash-safe. Sequence resets are global, so _finalize.sql runs once after all chunks.
+# join-up pass. Load sequence, all while the cluster is unlogged (WAL is the bottleneck
+# that caps parallel COPY):
+#   1. drop secondary indexes so COPY doesn't maintain them under concurrency
+#   2. parallel COPY the chunks
+#   3. rebuild the indexes in one bulk pass each (cheaper than incremental upkeep,
+#      and the win grows with row/index count — see SPIKE-parallel-copy.md)
+#   4. SET LOGGED — WAL-logs tables AND their fresh indexes together, once
+# Sequence resets are global, so _finalize.sql runs once after all chunks.
 JOBS="${SEED_LOAD_JOBS:-$(nproc)}"
+SEED_TABLES="park pitch van reservation"
 
-step "seed load (parallel COPY, -P $JOBS, unlogged)"
 su postgres -c "psql -v ON_ERROR_STOP=1 --username=$DB_USER --dbname=$DB_NAME -c \
   'ALTER TABLE reservation SET UNLOGGED; ALTER TABLE van SET UNLOGGED; ALTER TABLE pitch SET UNLOGGED; ALTER TABLE park SET UNLOGGED;'"
 
+# Capture the CREATE INDEX defs from the catalog (so this tracks the migrations with
+# no hand-maintained DDL), then drop those indexes. Secondary = not primary-key and
+# not backing a constraint (PKs / unique constraints stay — FKs depend on them).
+step "capture + drop secondary indexes (bulk-rebuild after load)"
+IDX_FILTER="i.indrelid = ANY (ARRAY['park','pitch','van','reservation']::regclass[]) AND NOT i.indisprimary AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)"
+su postgres -c "psql -tAX -v ON_ERROR_STOP=1 --username=$DB_USER --dbname=$DB_NAME -c \
+  \"SELECT pg_get_indexdef(i.indexrelid) || ';' FROM pg_index i WHERE $IDX_FILTER ORDER BY i.indexrelid::regclass::text;\"" \
+  > /work/rebuild-indexes.sql
+su postgres -c "psql -tAX -v ON_ERROR_STOP=1 --username=$DB_USER --dbname=$DB_NAME -c \
+  \"SELECT 'DROP INDEX ' || i.indexrelid::regclass::text || ';' FROM pg_index i WHERE $IDX_FILTER;\"" \
+  | su postgres -c "psql -v ON_ERROR_STOP=1 --username=$DB_USER --dbname=$DB_NAME"
+
+step "seed load (parallel COPY, -P $JOBS, unlogged, index-free)"
 # GNU xargs -P runs $JOBS psql processes concurrently, each COPYing one park chunk
 # over the local socket. ON_ERROR_STOP + set -e means any chunk failure aborts the build.
 ls /work/chunks/park-*.sql | xargs -P "$JOBS" -I {} \
   su postgres -c "psql -v ON_ERROR_STOP=1 --username=$DB_USER --dbname=$DB_NAME -f {}"
 
-step "SET LOGGED (rewrites tables into WAL for a crash-safe image)"
+step "rebuild secondary indexes (bulk, still unlogged)"
+run_sql "$DB_NAME" /work/rebuild-indexes.sql
+rm -f /work/rebuild-indexes.sql
+
+step "SET LOGGED (rewrites tables + indexes into WAL for a crash-safe image)"
 su postgres -c "psql -v ON_ERROR_STOP=1 --username=$DB_USER --dbname=$DB_NAME -c \
   'ALTER TABLE park SET LOGGED; ALTER TABLE pitch SET LOGGED; ALTER TABLE van SET LOGGED; ALTER TABLE reservation SET LOGGED;'"
 

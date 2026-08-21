@@ -40,14 +40,26 @@ another 29% (11.4 s → 8.1 s, 2.4× → 3.4×). That delta is the WAL cost: WAL
 the dominant bottleneck capping the logged parallel runs, exactly as expected —
 every worker funnels through the same WAL flush path.
 
-### Dropping indexes for the load isn't worth it (once WAL is off)
+### Drop indexes for the load, bulk-rebuild after — adopted
 Method E drops the five secondary indexes, loads index-free, then bulk-rebuilds
-them — timed end-to-end. It came in at 7.7 s vs D's 8.1 s: only ~5% faster. The
-index-free COPY is genuinely quicker, but the bulk `CREATE INDEX` pass pays most
-of that saving straight back. Once WAL is off, index maintenance is a minor cost
-on this dataset, not a real lever — and drop/rebuild adds moving parts (index
-DDL must be kept in sync with the migration by hand). Not adopted. It would only
-start to pay if the index set grew much heavier relative to the row payload.
+them — timed end-to-end. On this spike dataset it came in at 7.7 s vs D's 8.1 s:
+only ~5% faster, because the bulk `CREATE INDEX` pass pays back most of the
+index-free COPY saving.
+
+**But this gap widens with scale, so we adopt it.** The spike carries five small
+indexes over ~4M rows; the real dataset is far bigger and has many more indexes.
+Maintaining N indexes incrementally under concurrent COPY costs more per extra
+index (random page writes, contention) than rebuilding each once in a bulk pass
+that gets `maintenance_work_mem` to itself — so the ~5% here is a floor, not a
+ceiling. A small measured win that grows with row/index count is worth taking.
+
+The usual objection to drop/rebuild — hand-syncing index DDL with the migration —
+doesn't apply: `build-db.sh` reads the `CREATE INDEX` defs straight from the
+catalog (`pg_get_indexdef`) before dropping, so it tracks whatever the migrations
+create with zero hand-maintained SQL. "Secondary" = not a primary key and not
+backing a constraint (PKs / unique indexes stay, since FKs depend on them). The
+rebuild runs while the tables are still UNLOGGED, so it skips WAL too; `SET LOGGED`
+then WAL-logs tables and their fresh indexes together in one pass.
 
 ### Why partition by park (root aggregate), not "entities then relationships"
 The FK graph is a chain, so children need parent IDs. Generating entities
@@ -66,10 +78,13 @@ chunks contain exactly the same row set.
 
 ## Recommendation
 
-For the build-time bake, adopt **parallel COPY by park into UNLOGGED tables, then
-`SET LOGGED`** — now wired into `docker/build-db.sh`. The load runs unlogged to
-dodge the WAL ceiling, then flips the tables back to LOGGED so the final image is
-crash-safe (all four tables end at `relpersistence = 'p'`, verified).
+For the build-time bake, adopt **parallel COPY by park into UNLOGGED tables, with
+secondary indexes dropped for the load and bulk-rebuilt after, then `SET LOGGED`**
+— now wired into `docker/build-db.sh`. The full bake sequence, all while unlogged:
+drop secondary indexes → parallel COPY the chunks → bulk-rebuild the indexes →
+`SET LOGGED` (WAL-logs tables and their fresh indexes together, once). The image
+ends crash-safe: all four tables `relpersistence = 'p'` and all five secondary
+indexes valid — verified.
 
 `SET LOGGED` re-pays the WAL cost once, serially, but end-to-end still wins.
 Measured inside the bake (postgres:18, `-P 8`):
