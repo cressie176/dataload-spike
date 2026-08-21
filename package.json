@@ -7,6 +7,7 @@
   "scripts": {
     "generate:migration": "drizzle-kit generate",
     "generate:seed": "tsx scripts/generate-seed.ts",
+    "benchmark:parallel-copy": "bash scripts/benchmark-parallel-copy.sh",
     "image:hash": "tsx scripts/image-hash.ts",
     "db:up": "docker compose up -d --wait",
     "db:down": "docker compose down -v",
